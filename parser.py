@@ -53,7 +53,6 @@ HARD_MAX_CTX      = 16_384            # ceiling when a prompt needs more context
 class WorkExperience(BaseModel):
     title:      Optional[str] = None
     company:    Optional[str] = None
-    location:   Optional[str] = None
     start_date: Optional[str] = None
     end_date:   Optional[str] = None
     highlights: list[str]     = []
@@ -62,7 +61,6 @@ class Education(BaseModel):
     institution:    Optional[str] = None
     degree:         Optional[str] = None
     field_of_study: Optional[str] = None
-    start_date:     Optional[str] = None
     end_date:       Optional[str] = None
 
 class Certification(BaseModel):
@@ -77,7 +75,6 @@ class Project(BaseModel):
 class LeadershipEntry(BaseModel):
     role:         Optional[str] = None
     organization: Optional[str] = None
-    highlights:   list[str]     = []
 
 class Contact(BaseModel):
     email:    Optional[str] = None
@@ -85,28 +82,22 @@ class Contact(BaseModel):
     location: Optional[str] = None
     linkedin: Optional[str] = None
     github:   Optional[str] = None
-    website:  Optional[str] = None
+
 
 class Derived(BaseModel):
-    skills_normalized:   list[str]      = []
-    all_keywords:        list[str]      = []
+    skills_normalized:   list[str]       = []
+    all_keywords:        list[str]       = []
     years_experience:    Optional[float] = None
-    latest_title:        Optional[str]  = None
-    latest_company:      Optional[str]  = None
-    currently_employed:  Optional[bool] = None
-    education_level:     Optional[str]  = None
-    degrees:             list[str]      = []
-    has_leadership:      bool           = False
-    has_volunteering:    bool           = False
-    certification_names: list[str]      = []
+    latest_title:        Optional[str]   = None
+    latest_company:      Optional[str]   = None
+    currently_employed:  Optional[bool]  = None
+    education_level:     Optional[str]   = None
+    degrees:             list[str]       = []
+    certification_names: list[str]       = []
 
 class ResumeSchema(BaseModel):
     name:            Optional[str]         = None
     contact:         Contact               = Contact()
-    # BUG FIX: summary / publications / interests / source_file / model_used
-    # were being computed and stored in the result dict but silently dropped
-    # because the schema didn't include them.  Added them back here so
-    # model_validate() no longer discards them.
     summary:         Optional[str]         = None
     skills:          list[str]             = []
     work_experience: list[WorkExperience]  = []
@@ -115,13 +106,8 @@ class ResumeSchema(BaseModel):
     projects:        list[Project]         = []
     leadership:      list[LeadershipEntry] = []
     volunteering:    list[LeadershipEntry] = []
-    awards:          list[str]             = []
-    publications:    list[str]             = []
-    interests:       list[str]             = []
-    languages:       list[str]             = []
     derived:         Derived               = Derived()
     source_file:     Optional[str]         = None
-    model_used:      Optional[str]         = None
 
 
 # ---------------------------------------------------------------------------
@@ -636,11 +622,10 @@ class LosslessCompressor:
         ("[EXP]", r"experiences?|employment|work(?:ed|ing)?|career|positions?|internships?|placements?|jobs?|roles?"),
         ("[SKL]", r"skills?|skillset|competenc(?:y|ies)|expertise|toolbox|technologies|tools|tooling|stack|proficienc(?:y|ies)|strengths|programming|frameworks|software|technical|technologies"),
         ("[CRT]", r"certifications?|certificates?|certified|licen[sc]es?|credentials?|accreditations?|trainings?"),
-        ("[AWD]", r"awards?|honou?rs?|achievements?|accomplishments?|scholarships?|recognitions?|distinctions?|prizes?|fellowships?"),
-        ("[PUB]", r"publications?|research|papers?|presentations?|patents?|conferences?|talks?"),
+       
         ("[SUM]", r"summary|objectives?|profile|about|overview|statement|introduction|highlights|bio"),
-        ("[INT]", r"interests?|hobbies|hobby|passions?"),
-        ("[LNG]", r"languages?|linguistic"),
+
+   
         ("[REF]", r"references?|referees?"),
         ("[CON]", r"contacts?|details|information|info"),
     ]
@@ -680,15 +665,7 @@ class LosslessCompressor:
         text  = re.sub(r"\n{3,}", "\n\n", text)
         text  = re.sub(r"(?im)^(page \d+ of \d+|curriculum vitae)\s*$", "", text)
         text  = "\n".join(self._tag_lines(text.splitlines()))
-        deduped: list[str] = []
-        prev_key = None
-        for line in text.splitlines():
-            key = line.strip().lower()
-            if key and key == prev_key:
-                continue
-            deduped.append(line)
-            prev_key = key
-        text = "\n".join(deduped)
+
         text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         return text
@@ -982,76 +959,364 @@ Rules:
 - Copy every string VERBATIM from the text. Never paraphrase, never invent.
 - Unknown field -> null. Absent list -> [].
 - Dates: copy exactly as written. Current / ongoing role -> end_date "Present".
+- Skills: split on BOTH commas AND the word "and". "Python and Java" -> ["Python", "Java"].
+- A project TITLE is the name of the work (e.g. "Wildfire Detection System"), NOT the \
+person's role (e.g. "Lead Programmer"). If only a role is visible, leave title as the \
+project name and add a "role" field for the person's function.
 - Return only the JSON object.\
 """
 
 _SECTION_INSTRUCTIONS: dict[str, str] = {
     "work_experience": (
-        "Extract EVERY employment role as a separate work_experience object. "
-        "A bullet may begin a NEW JOB when it contains a job title and is followed "
-        "by a company/date line. Do NOT automatically treat bullets as highlights. "
-        "A common resume format is:\n"
-        "- Job Title (Full-time)\n"
-        "Company Name | MM/YYYY - MM/YYYY\n"
-        "\n"
-        "Another Job Title\n"
-        "Another Company | MM/YYYY - Present\n"
-        "\n"
-        "For this format, create one work_experience object per title/company/date pair. "
-        "Only treat bullet lines as highlights when they are responsibilities or "
-        "accomplishments belonging to a previously identified job."
+        "Extract EVERY distinct employment position listed anywhere in the resume. "
+        "Return one work_experience object for each distinct job.\n\n"
+
+        "Required output fields:\n"
+        "- title\n"
+        "- company\n"
+        "- start_date\n"
+        "- end_date\n"
+        "- highlights[]\n\n"
+
+        "Rules:\n"
+        "- Search the ENTIRE provided text, not only a section titled "
+        "'Work Experience', 'Employment', or 'Experience'.\n"
+        "- Create exactly ONE object for each distinct employment position.\n"
+        "- Never merge two different positions, even when they are at the same company.\n"
+        "- If the same position appears multiple times, keep only the most complete occurrence.\n"
+        "- Preserve job titles and company names as written whenever possible.\n"
+        "- Remove employment-type labels such as '(Full-time)', '(Part-time)', "
+        "'Intern', or similar from the title only when they are clearly metadata rather "
+        "than part of the actual title.\n"
+        "- A job title followed by a company/date line is a JOB HEADER, not a highlight.\n"
+        "- A bullet containing a responsibility, task, accomplishment, achievement, "
+        "or contribution belongs in highlights[].\n"
+        "- NEVER place the job title, company name, location, or dates inside highlights[].\n"
+        "- NEVER place skill lists, technology lists, or tool lists inside highlights[] "
+        "unless they are part of a full sentence describing an accomplishment.\n"
+        "- A highlights[] entry must be a sentence or phrase describing a responsibility "
+        "or achievement, NOT a bare comma-separated list of technologies.\n"
+        "- Do not create a job from a company name alone.\n"
+        "- Do not create a job from a job title alone unless the resume clearly presents "
+        "it as an employment position.\n"
+        "- If company is not explicitly stated, use null.\n"
+        "- If start_date is not explicitly stated, use null.\n"
+        "- If end_date is not explicitly stated, use null.\n"
+        "- For 'Present', 'Current', or equivalent wording, set end_date to null.\n"
+        "- Do not infer dates from surrounding jobs.\n"
+        "- Do not invent employers, titles, dates, or responsibilities.\n"
+        "- Preserve the chronological information exactly enough to distinguish positions.\n\n"
+
+        "Recognize all of these formats:\n"
+        "FORMAT A:\n"
+        "Software Engineer\n"
+        "Acme Corp | Jan 2023 - Present\n"
+        "- Built APIs\n\n"
+
+        "FORMAT B:\n"
+        "Software Engineer, Jan 2023 - Present\n"
+        "Acme Corp\n"
+        "- Built APIs\n\n"
+
+        "FORMAT C:\n"
+        "- Software Engineer (Full-time)\n"
+        "Acme Corp | May 2025 - Nov 2025\n"
+        "- Built APIs\n\n"
+
+        "FORMAT D:\n"
+        "Acme Corp\n"
+        "Software Engineer\n"
+        "Jan 2023 - Present\n"
+        "- Built APIs\n\n"
+
+        "FORMAT E:\n"
+        "Software Engineer | Acme Corp | Jan 2023 - Present\n"
+        "- Built APIs\n\n"
+
+        "A line beginning with a bullet does NOT automatically mean it is a "
+        "responsibility. If the line contains a job title and is followed by company "
+        "or date information, treat it as a job header.\n\n"
+
+        "Return only employment positions that are actually supported by the resume."
     ),
+
     "education": (
-        "Extract one object per degree or programme. "
-        "Use start_date for enrolment year and end_date for graduation year "
-        "(null if still in progress). "
-        "Do not extract GPA, highlights, or coursework.\n"
-        "Example: 'B.S. Computer Science, University of Texas, 2017-2019' -> "
-        "{\"institution\": \"University of Texas\", \"degree\": \"B.S.\", "
-        "\"field_of_study\": \"Computer Science\", "
-        "\"start_date\": \"2017\", \"end_date\": \"2019\"}"
+        "Extract EVERY distinct formal education entry listed anywhere in the resume. "
+        "Return one education object per degree, diploma, or formal academic programme.\n\n"
+
+        "Required output fields:\n"
+        "- institution\n"
+        "- degree\n"
+        "- field_of_study\n"
+        "- end_date\n\n"
+
+        "Rules:\n"
+        "- Search the ENTIRE resume for education information.\n"
+        "- Extract universities, colleges, institutes, schools, and other formal "
+        "educational institutions.\n"
+        "- Create one object for each distinct degree, diploma, or formal programme.\n"
+        "- institution = the institution name only.\n"
+        "- degree = the credential type only, such as 'B.Eng', 'B.Sc.', "
+        "'M.Sc.', 'MBA', 'Ph.D.', 'Diploma', or 'Certificate' when it is explicitly "
+        "an academic credential.\n"
+        "- field_of_study = the major, specialization, subject, or programme field.\n"
+        "- end_date = the stated graduation/completion date or year.\n"
+        "- If the programme is ongoing and no completion date is stated, use null.\n"
+        "- If no completion date is explicitly stated, use null.\n"
+        "- Do not infer graduation dates from enrolment dates.\n"
+        "- Do not copy GPA, grades, coursework, modules, achievements, or descriptions "
+        "into the education object.\n"
+        "- Do not treat ordinary online courses, workshops, training sessions, or "
+        "skills as degrees unless explicitly presented as formal academic credentials.\n"
+        "- Do not invent missing institution, degree, field, or date information.\n"
+        "- Preserve the original institution and credential names where possible.\n\n"
+
+        "Examples:\n"
+        "'B.Eng Mechanical Engineering, Western University, 2024 - Present' ->\n"
+        '{"institution": "Western University", "degree": "B.Eng", '
+        '"field_of_study": "Mechanical Engineering", "end_date": null}\n\n'
+
+        "'B.S. Computer Science, University of Texas, 2017-2019' ->\n"
+        '{"institution": "University of Texas", "degree": "B.S.", '
+        '"field_of_study": "Computer Science", "end_date": "2019"}'
     ),
+
     "certifications": (
-        "Extract every certification, license, award or prize as one object "
-        "(name, issuer, date)."
+        "Extract EVERY distinct formal certification, professional license, "
+        "accreditation, or formal credential explicitly listed anywhere in the resume.\n\n"
+
+        "Required output fields:\n"
+        "- name\n"
+        "- issuer\n"
+        "- date\n\n"
+
+        "Rules:\n"
+        "- Search the ENTIRE resume, not only a section named 'Certifications'.\n"
+        "- Extract certifications, licenses, accreditations, and other formal "
+        "professional credentials only when the resume explicitly presents them "
+        "as such.\n"
+        "- Return ONE object per distinct credential.\n"
+        "- name = the exact certification/license/credential name.\n"
+        "- issuer = the organization that issued or awarded the credential, "
+        "only when explicitly stated.\n"
+        "- date = the certification/award/issue/completion date or year, "
+        "only when explicitly stated.\n"
+        "- Use null when issuer or date is not explicitly provided.\n"
+        "- Never infer the issuer from the certification name.\n"
+        "- Never infer a date from surrounding text.\n"
+        "- Never fabricate missing information.\n"
+        "- Preserve the original credential name as written.\n"
+        "- Do NOT include university degrees or diplomas that belong in education.\n"
+        "- Do NOT include ordinary courses, workshops, seminars, training sessions, "
+        "skills, technologies, projects, job titles, or work experience.\n"
+        "- Do NOT convert an ordinary achievement, competition result, honor, "
+        "or prize into a certification unless the resume explicitly identifies it "
+        "as a formal credential/certification/license/accreditation.\n"
+        "- If the same certification appears multiple times, return it only once.\n"
+        "- Do not create an entry merely because a certification is implied by a skill.\n"
     ),
+
     "projects": (
-        "Extract one object per project. title = the project name, "
-        "description = the full remaining text for that project as one string."
+        "Extract EVERY distinct project explicitly described in the resume.\n\n"
+
+        "Required output fields:\n"
+        "- title\n"
+        "- description\n\n"
+
+        "Rules:\n"
+        "- Search the ENTIRE resume for project information.\n"
+        "- Return one object per distinct project.\n"
+        "- title = the PROJECT NAME, not the person's role.\n"
+        "- Use the explicitly stated project name whenever one exists.\n"
+        "- Do NOT use roles such as 'Lead Programmer', 'Developer', 'Designer', "
+        "'Engineer', or 'Team Member' as the project title.\n"
+        "- If a role appears before the project name, ignore the role and use the "
+        "project name.\n"
+        "- If no explicit project name exists, use the most descriptive project-specific "
+        "noun phrase supported by the text.\n"
+        "- description = the substantive description of the project, including "
+        "what was built, its purpose, technologies used, methods, and outcomes "
+        "when explicitly provided.\n"
+        "- Do not add information that is not present in the resume.\n"
+        "- Do not turn ordinary work responsibilities into projects unless they are "
+        "explicitly presented as a project.\n"
+        "- Do not turn skills, technologies, courses, or job titles into projects.\n"
+        "- If the same project appears multiple times, merge the information into "
+        "one object rather than creating duplicates.\n"
+        "- Preserve important technical terminology exactly as written.\n\n"
+
+        "Examples:\n"
+        "'Lead Programmer — VEX Robotics Team\\n"
+        "Implemented PID control...' ->\n"
+        '{"title": "VEX Robotics", "description": "Implemented PID control..."}\n\n'
+
+        "'Wildfire Detection Camera Module\\n"
+        "Designed a camera module that predicts wildfire spread...' ->\n"
+        '{"title": "Wildfire Detection Camera Module", '
+        '"description": "Designed a camera module that predicts wildfire spread..."}'
     ),
+
     "leadership": (
-        "Extract one object per role: student clubs, committees, volunteer or "
-        "community roles, sports captaincies, student government. "
-        "Skip plain awards/honors that are not roles. "
-        "Each bullet -> one highlights[] element."
+        "Extract EVERY distinct leadership position or leadership responsibility "
+        "explicitly described in the resume.\n\n"
+
+        "Required output fields:\n"
+        "- role\n"
+        "- organization\n\n"
+
+        "Include:\n"
+        "- Student club leadership\n"
+        "- Competitive team leadership\n"
+        "- Robotics team leadership\n"
+        "- Racing team leadership\n"
+        "- Hackathon/team leadership\n"
+        "- Committee leadership\n"
+        "- Student government\n"
+        "- Captaincies\n"
+        "- President/vice-president/secretary/treasurer roles\n"
+        "- Other explicitly stated leadership positions\n\n"
+
+        "Rules:\n"
+        "- Search the ENTIRE resume.\n"
+        "- Return one object per distinct leadership role.\n"
+        "- role = the person's explicit leadership title or function.\n"
+        "- organization = the club, team, committee, organization, or body.\n"
+        "- Preserve names and titles as written.\n"
+        "- Competitive teams may be leadership entries when the person has an "
+        "explicit leadership role or function.\n"
+        "- Do not create a leadership entry merely because someone participated "
+        "in a team or competition.\n"
+        "- Do not treat an ordinary employee position as leadership unless it is "
+        "explicitly presented as a leadership role.\n"
+        "- Do not extract awards, prizes, certifications, skills, or projects as leadership.\n"
+        "- Do not extract bullet descriptions or highlights because the schema "
+        "does not contain a highlights field.\n"
+        "- If organization is not explicitly stated, use null.\n"
+        "- If a leadership role is not explicitly identifiable, do not invent one.\n"
     ),
+
     "volunteering": (
-        "Extract one object per volunteer / community-service role "
-        "(role, organization). Each bullet -> one highlights[] element. "
-        "Copy wording verbatim; leave organization null if not stated."
+        "Extract EVERY distinct volunteer or community-service position explicitly "
+        "described in the resume.\n\n"
+
+        "Required output fields:\n"
+        "- role\n"
+        "- organization\n"
+        "- highlights[]\n\n"
+
+        "Rules:\n"
+        "- Search the ENTIRE resume.\n"
+        "- Extract unpaid volunteer, community-service, charitable, or community "
+        "engagement roles.\n"
+        "- Return one object per distinct volunteering position.\n"
+        "- role = the person's volunteer role or function.\n"
+        "- organization = the organization associated with the role.\n"
+        "- Use null if the organization is not explicitly stated.\n"
+        "- highlights[] = responsibilities, activities, or accomplishments explicitly "
+        "associated with that volunteering role.\n"
+        "- Each distinct bullet/responsibility should normally become one highlights[] "
+        "element.\n"
+        "- Preserve wording from the resume; do not invent accomplishments.\n"
+        "- Do not classify paid employment, internships, projects, clubs, or ordinary "
+        "extracurricular participation as volunteering unless the resume explicitly "
+        "identifies it as volunteer/community service.\n"
+        "- If no volunteering information is present, return an empty list.\n"
     ),
+
     "job_headers": (
-        "Each numbered entry below is the heading of ONE job. For every entry "
-        "return one object with the same index, splitting the heading into "
-        "title, company, location, start_date and end_date. "
-        "Return exactly one object per numbered entry, in order, and never "
-        "merge or skip an entry. Copy substrings verbatim; if a part is not "
-        "present use null.\n"
-        "Example entry:\n"
-        "[1]\nSenior Analyst Jan 2019 - Mar 2021\nAcme Corp, Boston, MA\n"
-        "Example object:\n"
+        "The input contains numbered job-header entries. Each numbered entry represents "
+        "EXACTLY ONE employment position.\n\n"
+
+        "For EVERY numbered entry:\n"
+        "- Return exactly one object.\n"
+        "- Preserve the original index.\n"
+        "- Never merge entries.\n"
+        "- Never skip entries.\n"
+        "- Never create additional entries.\n\n"
+
+        "Required fields:\n"
+        "- index\n"
+        "- title\n"
+        "- company\n"
+        "- location\n"
+        "- start_date\n"
+        "- end_date\n\n"
+
+        "Rules:\n"
+        "- Split each heading into the fields above using only information explicitly "
+        "present in that numbered entry.\n"
+        "- Copy substrings as faithfully as possible.\n"
+        "- Do not infer missing values.\n"
+        "- Use null for any field that is not explicitly present.\n"
+        "- 'Present', 'Current', or equivalent means end_date = null.\n"
+        "- Do not use information from another numbered entry to fill missing fields.\n"
+        "- Keep the objects in exactly the same order as the input entries.\n\n"
+
+        "Example:\n"
+        "[1]\n"
+        "Senior Analyst Jan 2019 - Mar 2021\n"
+        "Acme Corp, Boston, MA\n\n"
+
+        "Return:\n"
         '{"index": 1, "title": "Senior Analyst", "company": "Acme Corp", '
         '"location": "Boston, MA", "start_date": "Jan 2019", "end_date": "Mar 2021"}'
     ),
+
     "header": (
-        "Extract the candidate's personal full name (not a document title) "
-        "and contact details."
+        "Extract ONLY the candidate's personal identity and contact information "
+        "that are explicitly present in the resume.\n\n"
+
+        "Rules:\n"
+        "- Extract the candidate's actual personal full name, not a filename, "
+        "resume title, section heading, or job title.\n"
+        "- Extract contact information only when explicitly present.\n"
+        "- Do not infer or fabricate information.\n"
+        "- Do not treat company names, university names, or organization names "
+        "as the candidate's name.\n"
+        "- Preserve names and contact details as written where possible.\n"
+        "- If a supported field is not present, use null.\n"
+        "- Ignore references and information belonging to other people."
     ),
+
     "full": (
-        "Extract the whole resume. Every job -> work_experience[]; each bullet -> "
-        "highlights[]. Split comma-separated skills into individual strings. "
-        "Awards and licenses -> certifications[]. Clubs/volunteering -> leadership[]. "
-        "Ignore references."
+        "Extract the ENTIRE resume into ONLY the fields defined by the provided schema.\n\n"
+
+        "GLOBAL RULES:\n"
+        "- Search the entire resume before producing the result.\n"
+        "- Extract only information explicitly supported by the resume.\n"
+        "- Never invent, infer, or hallucinate names, dates, companies, institutions, "
+        "credentials, responsibilities, skills, or projects.\n"
+        "- Use null for missing scalar values and [] for missing list values, "
+        "according to the schema.\n"
+        "- Preserve the candidate's wording where practical.\n"
+        "- Remove duplicate entries when the same item appears multiple times.\n"
+        "- Do not create fields that are not defined in the schema.\n"
+        "- Do not return unsupported sections such as languages, awards, publications, "
+        "interests, hobbies, references, or other fields unless they are explicitly "
+        "part of the provided schema.\n"
+        "- Ignore references/recommendations unless the schema explicitly supports them.\n\n"
+
+        "FIELD RULES:\n"
+        "- work_experience[]: one object per distinct employment position. "
+        "Separate different titles at the same company. highlights[] contains "
+        "responsibilities and accomplishments only.\n"
+        "- education[]: one object per distinct formal degree, diploma, or academic "
+        "programme. Do not include GPA/coursework as separate entries.\n"
+        "- certifications[]: formal certifications, licenses, accreditations, and "
+        "formal credentials only. Do not automatically classify awards or prizes "
+        "as certifications.\n"
+        "- projects[]: one object per distinct project. title must be the project "
+        "name rather than the person's role.\n"
+        "- leadership[]: explicit leadership positions only. Do not treat ordinary "
+        "team participation as leadership.\n"
+        "- volunteering[]: explicit volunteer/community-service positions only.\n"
+        "- skills[]: extract individual skills explicitly listed or clearly identified "
+        "as skills. Split combined skill lists into individual items where appropriate. "
+        "Do not turn every word in a job description into a skill.\n\n"
+
+        "IMPORTANT:\n"
+        "Return ONLY schema-supported fields. Never add extra keys even when the "
+        "resume contains information that does not have a corresponding schema field."
     ),
 }
 
@@ -1109,10 +1374,6 @@ class _FullOut(BaseModel):
     projects:        list[Project]         = []
     leadership:      list[LeadershipEntry] = []
     volunteering:    list[LeadershipEntry] = []
-    awards:          list[str]             = []
-    publications:    list[str]             = []
-    interests:       list[str]             = []
-    languages:       list[str]             = []
 
 
 # ---------------------------------------------------------------------------
@@ -1439,12 +1700,12 @@ class ListParser:
 
     @staticmethod
     def _split_skills(line: str) -> list[str]:
-        """Split on comma/semicolon, and on slash only where it is spaced.
-
-        A bare slash usually belongs to the skill itself: CI/CD, UI/UX,
-        TCP/IP and HTML/CSS each name one thing, not two.
-        """
-        line = re.sub(r"\s+/\s+|\s*[|\u2022\u00b7]\s*", " ; ", line)
+        # FIX 2: Also handle bullet dots, en-dashes used as list separators,
+        # and "and" used between exactly two skills (not inside a skill name)
+        line = re.sub(r"\s+/\s+|\s*[|\u2022\u00b7\u2023\u25e6]\s*", " ; ", line)
+        line = re.sub(r"\s+\u2013\s+|\s+\u2014\s+", " ; ", line)  # en/em dash as separator
+        # Split " and " only when it joins short tokens (likely skill names, not a phrase)
+        line = re.sub(r"(?<=[A-Za-z0-9\+\#])\s+and\s+(?=[A-Z][a-z]|[A-Z]{2,})", " ; ", line)
         parts: list[str] = []
         depth = 0
         current: list[str] = []
@@ -1485,6 +1746,8 @@ class ListParser:
 _YEAR_RANGE = re.compile(
     r"\b((?:19|20)\d{2})\s*(?:[-\u2013\u2014]|to)\s*((?:19|20)\d{2}|present|current)\b", re.I)
 _YEAR       = re.compile(r"\b((?:19|20)\d{2})\b")
+# Shared year matcher used by grounding/sanitization helpers.
+_YEAR_RE    = _YEAR
 _BULLET_RX  = re.compile(r"^[\-\*\u2022>\u25cf\u25aa\u2023\u25e6]\s+")
 
 
@@ -1513,6 +1776,71 @@ def _entries(text: str, starts_entry) -> list[list[str]]:
     if cur:
         entries.append(cur)
     return entries
+
+def _reslice_sections(
+    sections_compressed: dict[str, str],
+    cleaned: str,
+) -> dict[str, str]:
+    """
+    Given section bodies from the compressed text, find the same content
+    in `cleaned` and return section bodies from there instead.
+
+    Strategy:
+    - For each section, take the first non-empty, non-tag line as an anchor.
+    - Search for that anchor in cleaned text (case-insensitive).
+    - Slice from that position to where the next section starts.
+    """
+    if not cleaned:
+        return sections_compressed
+
+    # Build an ordered list of (tag, anchor_line)
+    ordered_tags = list(sections_compressed.keys())
+    anchors: list[tuple[str, int]] = []   # (tag, position in cleaned)
+
+    for tag in ordered_tags:
+        body = sections_compressed[tag]
+        anchor = _first_anchor_line(body)
+        if not anchor:
+            anchors.append((tag, -1))
+            continue
+        # Case-insensitive search in cleaned
+        idx = cleaned.lower().find(anchor.lower())
+        anchors.append((tag, idx))
+
+    # Sort by position so we can slice ranges
+    # (tags not found get position -1; keep them at the end)
+    found = [(tag, pos) for tag, pos in anchors if pos >= 0]
+    found.sort(key=lambda x: x[1])
+    not_found = [tag for tag, pos in anchors if pos < 0]
+
+    result: dict[str, str] = {}
+    for i, (tag, start) in enumerate(found):
+        end = found[i + 1][1] if i + 1 < len(found) else len(cleaned)
+        result[tag] = cleaned[start:end].strip()
+
+    # Fall back to compressed body for sections we couldn't locate
+    for tag in not_found:
+        result[tag] = sections_compressed[tag]
+
+    # Preserve _header if present
+    if "_header" in sections_compressed and "_header" not in result:
+        result["_header"] = sections_compressed["_header"]
+
+    return result
+
+
+def _first_anchor_line(body: str) -> str:
+    """Return the first substantive line from a section body (no tags, no bullets)."""
+    for line in body.splitlines():
+        line = line.strip()
+        # Skip tag lines like [EXP], [SKL], etc.
+        if re.match(r"^\[[A-Z]{3}\]$", line):
+            continue
+        # Skip very short or bullet-only lines
+        line = re.sub(r"^[\-\*\u2022>|]+\s*", "", line).strip()
+        if len(line) >= 8:
+            return line
+    return ""
 
 
 class EducationParser:
@@ -1950,201 +2278,565 @@ class JobSegmenter:
 # Structured extractor
 # ---------------------------------------------------------------------------
 
+class _SummaryOut(BaseModel):
+    summary: Optional[str] = None
+
+class _SkillsOut(BaseModel):
+    skills: list[str] = []
+
+
+class _JobBlockOut(BaseModel):
+    index: int
+    title: Optional[str] = None
+    company: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+class _JobBlocksOut(BaseModel):
+    jobs: list[_JobBlockOut] = []
+
+
 class StructuredExtractor:
+    """
+    Section-aware hybrid extractor.
 
-    _LLM_SECTIONS: list[tuple[tuple[str, ...], str, type[BaseModel]]] = [
-        (("[EDU]",), "education",       _EduOut),
-        (("[CRT]",), "certifications",  _CrtOut),
-        (("[PRJ]",), "projects",        _PrjOut),
-        (("[LDR]",), "leadership",      _LdrOut),
-        (("[VOL]",), "volunteering",    _VolOut),
-    ]
-    # Sections whose shape is regular enough to read without the model.  The
-    # model is still asked when a parser finds nothing.
-    _RULE_SECTIONS = {
-        "education":      EducationParser(),
-        "certifications": CertificationParser(),
-        "projects":       ProjectParser(),
-        "leadership":     LeadershipParser(),
-        "volunteering":   LeadershipParser(),
+    Design goals:
+      1. Python owns document structure and never asks the LLM to reconstruct
+         the entire resume at once.
+      2. The LLM interprets ONE semantic section at a time.
+      3. Work experience is segmented before the LLM sees it.  The model labels
+         each job header; Python keeps the original bullets verbatim.
+      4. Deterministic parsers are validation/fallback mechanisms, not the sole
+         source of truth.
+      5. A full-resume LLM call is used only when section detection genuinely
+         fails, rather than as the normal path.
+    """
+
+    _SECTION_MODELS: dict[str, type[BaseModel]] = {
+        "summary": _SummaryOut,
+        "skills": _SkillsOut,
+        "education": _EduOut,
+        "certifications": _CrtOut,
+        "projects": _PrjOut,
+        "leadership": _LdrOut,
+        "volunteering": _VolOut,
     }
-    _LIST_SECTIONS = {"[SKL]": "skills", "[INT]": "interests", "[LNG]": "languages"}
-    _LINE_SECTIONS = {"[AWD]": "awards", "[PUB]": "publications"}
-    _IGNORED       = {"[REF]"}
 
-    _CHARS_PER_TOKEN  = 3.2
+    _SECTION_PROMPTS: dict[str, str] = {
+        "summary": (
+            "Extract ONLY the professional summary/profile/objective from this section.\n"
+            "Return the summary as one string. Copy the wording from the resume; do not "
+            "rewrite or combine unrelated sections. If no summary exists, return null."
+        ),
+        "skills": (
+            "Extract EVERY explicit skill listed in this SKILLS section.\n\n"
+            "Rules:\n"
+            "- Return individual skills, not sentences.\n"
+            "- Split comma-separated and semicolon-separated skills.\n"
+            "- Split clear 'and' lists such as 'Python and Java'.\n"
+            "- Preserve technical names such as C#, C++, Node.js, ASP.NET Core, RAG.\n"
+            "- Do not turn section headings, job titles, project names, certifications, "
+            "or descriptive sentences into skills.\n"
+            "- Do not invent synonyms.\n"
+            "- If the section contains categories such as 'Programming: Python, Java', "
+            "return Python and Java, not 'Programming'."
+        ),
+        "education": (
+            "Extract EVERY distinct formal education credential/program in this EDUCATION "
+            "section. Return one object per distinct degree, diploma, HND, or formal academic "
+            "program.\n\n"
+            "Rules:\n"
+            "- institution = institution name only.\n"
+            "- degree = credential type/name, e.g. BSc, MSc, HND, Diploma.\n"
+            "- field_of_study = major/specialization/program field.\n"
+            "- end_date = explicitly stated completion/graduation date/year; otherwise null.\n"
+            "- Do not create entries for grades, individual subjects, coursework, skills, or "
+            "section headings.\n"
+            "- Keep an institution and its degree together even when they occur on adjacent "
+            "lines.\n"
+            "- Do not infer missing dates or institutions."
+        ),
+        "certifications": (
+            "Extract EVERY distinct formal certification, professional license, accreditation, "
+            "or credential explicitly listed in this CERTIFICATIONS section.\n\n"
+            "Rules:\n"
+            "- One object per credential.\n"
+            "- name = certification/credential name only.\n"
+            "- issuer = issuer only when explicitly stated.\n"
+            "- date = explicitly stated certification/award/completion date/year.\n"
+            "- Do NOT include degrees, diplomas, skills, courses, projects, job titles, "
+            "awards, or section headings unless explicitly identified as a formal credential.\n"
+            "- Do not interpret a provider's product/course catalog as separate certifications.\n"
+            "- Ignore '(View Badge)', links, and other badge UI text unless they themselves "
+            "are the credential name."
+        ),
+        "projects": (
+            "Extract EVERY distinct project in this PROJECTS section.\n\n"
+            "Rules:\n"
+            "- One object per project.\n"
+            "- title MUST be the project name, not a role such as Developer, Programmer, "
+            "Engineer, or Team Member.\n"
+            "- description contains the substantive project description and explicitly stated "
+            "technologies/methods/outcomes.\n"
+            "- Join wrapped lines belonging to the same project.\n"
+            "- Do not turn technologies, isolated labels, or section headings into projects.\n"
+            "- Do not invent a project name if none is present; use the clearest supported "
+            "project-specific phrase.\n"
+            "- Merge duplicate mentions of the same project."
+        ),
+        "leadership": (
+            "Extract EVERY explicit leadership role in this LEADERSHIP/EXTRACURRICULAR "
+            "section.\n\n"
+            "Rules:\n"
+            "- role = the person's leadership role/function.\n"
+            "- organization = associated team/club/committee/organization when stated.\n"
+            "- Do not classify ordinary participation, awards, projects, or employment as "
+            "leadership unless leadership is explicit.\n"
+            "- Do not create an entry for the section heading itself."
+        ),
+        "volunteering": (
+            "Extract EVERY explicit volunteer/community-service role in this section.\n\n"
+            "Rules:\n"
+            "- role = volunteer role/function.\n"
+            "- organization = organization when stated.\n"
+            "- Do not classify paid work, internships, projects, clubs, or ordinary activities "
+            "as volunteering unless explicitly described as volunteer/community service.\n"
+            "- If there are no explicit volunteer roles, return []."
+        ),
+        "job_headers": (
+            "Each numbered item below represents EXACTLY ONE employment position.\n\n"
+            "Extract the fields from each numbered job header.\n"
+            "Rules:\n"
+            "- Return exactly one object for every input index. Never merge or omit indexes.\n"
+            "- title = job title only.\n"
+            "- company = employer only.\n"
+            "- start_date/end_date = dates explicitly attached to that job.\n"
+            "- If end date says Present/Current/Ongoing, return end_date='Present'.\n"
+            "- Do not infer a date from another job.\n"
+            "- Do not put company/date/title text in a different field.\n"
+            "- location is intentionally not requested because the current schema does not "
+            "contain a work-experience location field.\n"
+            "- Preserve title/company wording as written except for obvious employment-type "
+            "parentheticals such as '(Full-time)' when they are clearly metadata."
+        ),
+        "header": (
+            "Extract only the candidate's name and contact information from this header text. "
+            "Do not extract another person's information from references. Do not infer missing "
+            "fields. Return null for missing values."
+        ),
+        "full": (
+            "Extract the resume into the supplied schema. This is a LAST-RESORT fallback only. "
+            "Search the entire text. Do not invent information. Keep separate jobs separate. "
+            "Never put a section heading, job title, company, project, or degree into the wrong "
+            "category. Return only schema-supported fields."
+        ),
+    }
+
+    _JUNK_HEADINGS = {
+        "work experience", "experience", "employment", "employment history",
+        "education", "academic qualifications", "skills", "certifications",
+        "projects", "leadership", "extracurricular activities", "volunteering",
+        "references", "summary", "profile", "objective", "contact", "contact information",
+    }
+
+    _ROLE_WORDS = frozenset("""
+        engineer developer programmer analyst manager director scientist intern consultant
+        designer architect specialist coordinator associate lead officer administrator assistant
+        technician teacher professor lecturer researcher accountant attorney supervisor strategist
+        marketer writer editor recruiter buyer chef therapist auditor controller trainer instructor
+        advisor representative clerk cashier server driver operator mechanic electrician founder
+        cofounder owner partner principal fellow ambassador apprentice trainee volunteer counselor
+    """.split())
+
+    _DATE_LINE = re.compile(
+        r"(?i)(?:\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{4}"
+        r"|\b\d{1,2}[/-]\d{4}\b|\b(?:19|20)\d{2}\b)"
+        r"\s*(?:-|\u2013|\u2014|to|until)\s*"
+        r"(?:present|current|ongoing|now|\d{1,2}[/-]\d{4}|(?:19|20)\d{2}|"
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{4})\b"
+    )
+    _PRESENT = re.compile(r"\b(present|current|ongoing|to date|now)\b", re.I)
+
+    _CHARS_PER_TOKEN = 3.2
     _OUTPUT_EXPANSION = 1.8
-    _MIN_PREDICT      = 256
-    _MAX_PREDICT      = 6000
+    _MIN_PREDICT = 128
+    _MAX_PREDICT = 5000
 
     def __init__(self, backend: OllamaBackend | OpenAICompatBackend,
                  *, verbose: bool = True) -> None:
-        self._llm      = backend
+        self._llm = backend
         self._splitter = SectionSplitter()
-        self._lists    = ListParser()
-        self._jobs     = JobSegmenter()
-        self._verbose  = verbose
+        self._lists = ListParser()
+        self._fallback_parsers = {
+            "education": EducationParser(),
+            "certifications": CertificationParser(),
+            "projects": ProjectParser(),
+        }
+        self._verbose = verbose
         self._schemas: dict[type[BaseModel], dict] = {}
 
-    def extract(self, compressed: str) -> dict[str, Any]:
-        # BUG FIX: guard against text that would overflow the context window
-        if len(compressed) > MAX_TEXT_CHARS:
-            log.warning(
-                "Compressed text is %d chars — truncating to %d to avoid context overflow",
-                len(compressed), MAX_TEXT_CHARS,
-            )
-            compressed = compressed[:MAX_TEXT_CHARS]
+    def extract(self, compressed: str, cleaned: str = "") -> dict[str, Any]:
+        # IMPORTANT: do not truncate at an arbitrary character boundary when a
+        # full resume is small enough for the configured context. Section calls
+        # below are deliberately much smaller than the whole resume.
+        sections_compressed = self._splitter.split(compressed)
+        sections = _reslice_sections(sections_compressed, cleaned) if cleaned else sections_compressed
 
-        sections = self._splitter.split(compressed)
         if "[CON]" in sections:
-            sections["_header"] = (sections.get("_header", "") + "\n"
-                                   + sections.pop("[CON]")).strip()
-        tags = [k for k in sections if k != "_header"]
+            sections["_header"] = (sections.get("_header", "") + "\n" + sections.pop("[CON]")).strip()
 
-        if "[EXP]" not in sections and "[EDU]" not in sections:
-            log.info("No section headers detected (%s) — single-call fallback",
-                     " ".join(tags) or "none")
-            return self._extract_full(compressed)
-
-        log.info("Sections: %s", " ".join(tags))
         result: dict[str, Any] = _FullOut().model_dump()
+        result["_header_text"] = sections.get("_header", "")
 
+        # Header text is preserved here, but the header LLM is intentionally
+        # deferred to ResumeParser.parse_text(). That avoids an unconditional
+        # extra Ollama call on every resume.
+        # ------------------------------ summary / skills: targeted LLM calls
         if "[SUM]" in sections:
-            result["summary"] = " ".join(
-                ln.strip() for ln in sections["[SUM]"].splitlines() if ln.strip())
-        for tag, key in self._LIST_SECTIONS.items():
-            if tag in sections:
-                result[key] = result[key] + self._lists.parse(sections[tag])
-        for tag, key in self._LINE_SECTIONS.items():
-            if tag in sections:
-                result[key] = result[key] + self._lines(sections[tag])
+            data = self._call("summary", _SummaryOut, sections["[SUM]"], budget=320)
+            result["summary"] = data.get("summary")
 
+        if "[SKL]" in sections:
+            data = self._call("skills", _SkillsOut, sections["[SKL]"], budget=500)
+            result["skills"] = self._clean_skill_output(data.get("skills") or [], sections["[SKL]"])
+
+        # ------------------------------ work: deterministic segmentation + LLM labeling
         if "[EXP]" in sections:
-            result["work_experience"] = self.extract_experience(sections["[EXP]"],
-                                                                compressed)
+            result["work_experience"] = self._extract_experience(sections["[EXP]"], cleaned or compressed)
 
-        for tag_group, key, model in self._LLM_SECTIONS:
-            chunk = "\n\n".join(sections[t] for t in tag_group if t in sections)
+        # ------------------------------ semantic sections
+        semantic = {
+            "[EDU]": ("education", _EduOut),
+            "[CRT]": ("certifications", _CrtOut),
+            "[PRJ]": ("projects", _PrjOut),
+            "[LDR]": ("leadership", _LdrOut),
+            "[VOL]": ("volunteering", _VolOut),
+        }
+
+        for tag, (key, model) in semantic.items():
+            chunk = sections.get(tag)
             if not chunk:
                 continue
-            parser = self._RULE_SECTIONS.get(key)
-            if parser and (parsed := parser.parse(chunk)):
-                log.info("%-18s %d entries (no model)", key, len(parsed))
-                result[key] = parsed
-                continue
-            data        = self._call(key, model, chunk)
-            result[key] = _scrub(data.get(key, []), compressed)
 
-        result["_header_text"] = sections.get("_header", "")
-        return result
+            # Deterministic parser is used as a SECONDARY check.  The LLM is
+            # still called for these sections so ambiguous layouts are interpreted
+            # semantically rather than being entirely controlled by regexes.
+            llm_data = self._call(key, model, chunk)
+            llm_items = llm_data.get(key) or []
 
-    # ------------------------------------------------------------- experience
+            fallback = self._fallback_parsers.get(key)
+            deterministic = fallback.parse(chunk) if fallback else []
+            result[key] = self._merge_section_items(key, llm_items, deterministic, chunk)
 
-    _JOBS_PER_CALL   = 10
-    _TOKENS_PER_JOB  = 70
+        # ------------------------------ no usable section structure: controlled fallback
+        meaningful = any(k.startswith("[") for k in sections)
+        if not meaningful:
+            log.warning("No semantic section tags detected; using controlled full-resume fallback")
+            fallback = self._call("full", _FullOut, cleaned or compressed)
+            if fallback:
+                result.update(fallback)
+                result["_header_text"] = sections.get("_header", "")
 
-    def extract_experience(self, chunk: str, source: str) -> list[dict[str, Any]]:
-        blocks = self._jobs.segment(chunk)
+        return _scrub(result, cleaned or compressed)
+
+    # ------------------------------------------------------------------ work experience
+
+    def _extract_experience(self, chunk: str, source: str) -> list[dict[str, Any]]:
+        blocks = self._segment_jobs(chunk)
         if not blocks:
-            return []
+            # Last resort for unusual experience formatting.
+            data = self._call("work_experience", _ExpOut, chunk)
+            return _scrub(data.get("work_experience") or [], source)
 
-        # Headings in an unambiguous shape are parsed here; the model is only
-        # paid for the ones that are genuinely ambiguous, which on most resumes
-        # means it is never called for work experience at all.
-        labelled: dict[int, dict[str, Any]] = {}
-        unsure: list[tuple[int, JobBlock]] = []
+        log.info("work_experience    %d candidate job blocks", len(blocks))
+
+        # Give the LLM only compact job headers. This is the critical change:
+        # the model cannot accidentally classify a project or certification as
+        # a job because those sections never enter this prompt.
+        numbered = []
         for i, block in enumerate(blocks, 1):
-            fields = JobSegmenter.confident_fields(block)
-            if fields:
-                labelled[i] = fields
-            else:
-                unsure.append((i, block))
-        if unsure:
-            log.info("work_experience    %d/%d headings need the model",
-                     len(unsure), len(blocks))
+            numbered.append(f"[{i}]\n" + "\n".join(block["headers"]))
+        prompt = "\n\n".join(numbered)
 
-        for start in range(0, len(unsure), self._JOBS_PER_CALL):
-            group  = unsure[start:start + self._JOBS_PER_CALL]
-            prompt = "\n\n".join(
-                f"[{idx}]\n" + "\n".join(b.headers or b.bullets[:1])
-                for idx, b in group)
-            data = self._call("job_headers", _JobHeadersOut, prompt,
-                              budget=self._TOKENS_PER_JOB * len(group) + 96)
-            valid = {idx for idx, _ in group}
-            for pos, entry in enumerate(data.get("jobs") or []):
-                idx = entry.get("index")
-                if idx not in valid:
-                    idx = group[pos][0] if pos < len(group) else None
-                if idx is not None:
-                    labelled.setdefault(idx, entry)
+        data = self._call(
+            "job_headers",
+            _JobBlocksOut,
+            prompt,
+            budget=max(320, min(1800, 95 * len(blocks) + 160)),
+        )
+        by_index = {int(j.get("index")): j for j in (data.get("jobs") or [])
+                    if str(j.get("index", "")).isdigit()}
 
         jobs: list[dict[str, Any]] = []
         for i, block in enumerate(blocks, 1):
-            entry = labelled.get(i) or {}
-            fields = {k: entry.get(k) for k in
-                      ("title", "company", "location", "start_date", "end_date")}
-            if not fields["title"] and not fields["company"]:
-                fields.update(JobSegmenter.fallback_fields(block))
+            model = by_index.get(i, {})
+            dates = self._dates_from_lines(block["headers"])
 
-            # Dates come from the source line whenever it states a range, so a
-            # hallucinated or shifted date can never reach the output.
-            start_date, end_date = self._dates_from(block)
-            if start_date:
-                fields["start_date"], fields["end_date"] = start_date, end_date
+            title = self._clean_job_field(model.get("title"))
+            company = self._clean_job_field(model.get("company"))
 
-            fields["highlights"] = block.bullets
-            if not any(fields.get(k) for k in ("title", "company")):
+            if not title or not company:
+                # Deterministic high-confidence recovery from the original lines.
+                guess = self._job_guess(block["headers"])
+                title = title or guess.get("title")
+                company = company or guess.get("company")
+
+            job = {
+                "title": title,
+                "company": company,
+                "start_date": dates[0] or model.get("start_date"),
+                "end_date": dates[1] or model.get("end_date"),
+                # CRITICAL: bullets are never generated by the LLM. They are
+                # copied directly from the extracted resume text.
+                "highlights": list(block["bullets"]),
+            }
+
+            # Reject section headings masquerading as jobs.
+            if self._is_section_heading(job.get("title")) or self._is_section_heading(job.get("company")):
                 continue
-            jobs.append(fields)
+            if not job["title"] and not job["company"]:
+                continue
+            jobs.append(job)
 
-        scrubbed = _scrub(jobs, source)
-        # Bullets are copied straight from the resume, so restore any that the
-        # generic grounding filter trimmed.
-        for original, out in zip(jobs, scrubbed):
-            out["highlights"] = original["highlights"]
-        log.info("work_experience    %d blocks -> %d jobs, %d highlights",
-                 len(blocks), len(scrubbed),
-                 sum(len(j["highlights"]) for j in scrubbed))
-        return scrubbed
+        return self._dedupe_jobs(jobs)
+
+    def _segment_jobs(self, text: str) -> list[dict[str, list[str]]]:
+        """
+        Segment employment using blank-line groups + date anchors.
+
+        Common resume format:
+            Title
+            Company | 05/2025 - 11/2025
+            - bullet
+
+        and:
+            Title
+            Company
+            05/2025 - 11/2025
+            - bullet
+
+        Both are kept as one block. A second date anchor starts the next job.
+        """
+        raw_lines = text.splitlines()
+        lines = [ln.strip() for ln in raw_lines]
+        groups: list[list[str]] = []
+        cur: list[str] = []
+        for line in lines:
+            if not line:
+                if cur:
+                    groups.append(cur)
+                    cur = []
+            else:
+                cur.append(line)
+        if cur:
+            groups.append(cur)
+
+        blocks: list[dict[str, list[str]]] = []
+        for group in groups:
+            # A group containing a date range is overwhelmingly likely to be a
+            # job entry in an already isolated [EXP] section.
+            date_positions = [i for i, ln in enumerate(group) if self._DATE_LINE.search(ln) or self._PRESENT.search(ln)]
+            if not date_positions:
+                if blocks:
+                    blocks[-1]["bullets"].extend(self._strip_bullets(group))
+                continue
+
+            if len(date_positions) == 1:
+                di = date_positions[0]
+                header_start = max(0, di - 2)
+                headers = group[header_start:di + 1]
+                # If a non-bullet line immediately follows the date and looks
+                # like an employer, include it in the header.
+                after = di + 1
+                if after < len(group) and not self._is_bullet(group[after]):
+                    if len(headers) < 4 and self._looks_like_company(group[after]):
+                        headers.append(group[after])
+                        after += 1
+                bullets = self._strip_bullets(group[after:])
+                blocks.append({"headers": headers, "bullets": bullets})
+                continue
+
+            # Multiple date ranges in one blank-line group: split at each date.
+            for n, di in enumerate(date_positions):
+                prev_di = date_positions[n - 1] if n else -1
+                start = max(prev_di + 1, di - 2)
+                end = date_positions[n + 1] - 2 if n + 1 < len(date_positions) else len(group)
+                headers = group[start:di + 1]
+                after = di + 1
+                if after < len(group) and after <= end and not self._is_bullet(group[after]):
+                    if len(headers) < 4 and self._looks_like_company(group[after]):
+                        headers.append(group[after])
+                        after += 1
+                bullets = self._strip_bullets(group[after:end + 1])
+                blocks.append({"headers": headers, "bullets": bullets})
+
+        # Merge accidental empty/fragment blocks into their predecessor.
+        return [b for b in blocks if b["headers"] or b["bullets"]]
 
     @staticmethod
-    def _dates_from(block: JobBlock) -> tuple[str | None, str | None]:
-        for line in block.headers:
-            m = _DATE_RANGE.search(line)
-            if m:
+    def _is_bullet(line: str) -> bool:
+        return bool(re.match(r"^\s*[-*\u2022\u25cf\u25aa\u2023\u25e6>|]\s*", line))
+
+    @classmethod
+    def _strip_bullets(cls, lines: list[str]) -> list[str]:
+        out: list[str] = []
+        for ln in lines:
+            if cls._is_bullet(ln):
+                ln = re.sub(r"^\s*[-*\u2022\u25cf\u25aa\u2023\u25e6>|]\s*", "", ln).strip()
+                if ln:
+                    out.append(ln)
+            elif out and not re.search(r"[.!?]$", out[-1]) and ln[:1].islower():
+                out[-1] += " " + ln
+            elif ln:
+                # Unbulleted prose inside a job is still a highlight.
+                out.append(ln)
+        return out
+
+    @classmethod
+    def _looks_like_company(cls, line: str) -> bool:
+        low = line.lower()
+        if any(x in low for x in ("ltd", "limited", "inc", "corp", "company", "pvt", "plc", "llc", "technologies", "solutions", "university", "institute", "bank")):
+            return True
+        return "|" in line and not cls._is_bullet(line)
+
+    @classmethod
+    def _job_guess(cls, headers: list[str]) -> dict[str, str | None]:
+        cleaned: list[str] = []
+        for line in headers:
+            line = cls._DATE_LINE.sub("", line)
+            line = cls._PRESENT.sub("", line)
+            line = re.sub(r"\(\s*full[- ]?time\s*\)|\(\s*part[- ]?time\s*\)", "", line, flags=re.I)
+            parts = [p.strip(" ,|-\u2013\u2014") for p in re.split(r"\s*[|\u2022]\s*", line) if p.strip()]
+            cleaned.extend(parts)
+
+        role_idx = []
+        for i, frag in enumerate(cleaned):
+            words = set(re.findall(r"[a-z]+", frag.lower()))
+            if words & cls._ROLE_WORDS:
+                role_idx.append(i)
+        title = cleaned[role_idx[0]] if role_idx else (cleaned[0] if cleaned else None)
+        company = None
+        for i, frag in enumerate(cleaned):
+            if i != (role_idx[0] if role_idx else 0) and cls._looks_like_company(frag):
+                company = frag
+                break
+        if company is None and len(cleaned) >= 2:
+            company = cleaned[1] if cleaned[1] != title else None
+        return {"title": title, "company": company}
+
+    @classmethod
+    def _dates_from_lines(cls, lines: list[str]) -> tuple[str | None, str | None]:
+        for line in lines:
+            if (m := _DATE_RANGE.search(line)):
                 return m.group(1).strip(), m.group(2).strip()
-        for line in block.headers:
-            if _PRESENT_RX.search(line):
-                m = re.search(_DATE_TOKEN, line, re.I)
-                if m:
-                    return m.group(0).strip(), "Present"
+            if (m := cls._DATE_LINE.search(line)):
+                # _DATE_LINE is intentionally broad; use the canonical range
+                # regex for the actual values.
+                if (m2 := _DATE_RANGE.search(line)):
+                    return m2.group(1).strip(), m2.group(2).strip()
+        for line in lines:
+            if cls._PRESENT.search(line):
+                return None, "Present"
         return None, None
 
+    @classmethod
+    def _clean_job_field(cls, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        value = re.sub(r"\s+", " ", value).strip(" |,-\u2013\u2014")
+        value = re.sub(r"\s*\((?:full[- ]?time|part[- ]?time|contract|internship)\)\s*$", "", value, flags=re.I)
+        if cls._is_section_heading(value):
+            return None
+        return value or None
+
+    @classmethod
+    def _is_section_heading(cls, value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        v = re.sub(r"[^a-z ]", "", value.lower()).strip()
+        return v in {re.sub(r"[^a-z ]", "", x).strip() for x in cls._JUNK_HEADINGS}
+
     @staticmethod
-    def _lines(block: str) -> list[str]:
-        out: list[str] = []
-        for ln in block.splitlines():
-            s        = ln.strip()
-            if not s:
+    def _dedupe_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for job in jobs:
+            key = tuple(str(job.get(k) or "").strip().lower()
+                        for k in ("title", "company", "start_date", "end_date"))
+            if key in seen and any(key):
+                # Keep the occurrence with more highlights.
+                for old in out:
+                    old_key = tuple(str(old.get(k) or "").strip().lower()
+                                    for k in ("title", "company", "start_date", "end_date"))
+                    if old_key == key and len(job.get("highlights") or []) > len(old.get("highlights") or []):
+                        old["highlights"] = job["highlights"]
                 continue
-            is_bullet = bool(re.match(r"^[\-\*>|]\s+", s))
-            s         = re.sub(r"^[\-\*>|]\s+", "", s)
-            if out and not is_bullet and s[:1].islower():
-                out[-1] = f"{out[-1]} {s}"
-            else:
-                out.extend(p.strip() for p in re.split(r";\s+", s) if p.strip())
+            seen.add(key)
+            out.append(job)
+        return out
+
+    # ------------------------------------------------------------------ validation / merging
+
+    def _merge_section_items(self, key: str, llm_items: list, deterministic: list, source: str) -> list:
+        llm_items = _scrub(llm_items, source) if llm_items else []
+        deterministic = _scrub(deterministic, source) if deterministic else []
+
+        if not llm_items:
+            return deterministic
+        if not deterministic:
+            return llm_items
+
+        # The LLM is primary for semantic interpretation. Deterministic entries
+        # are used only to recover entries that the model omitted entirely.
+        if key == "education":
+            return self._merge_by_identity(llm_items, deterministic, ("institution", "degree"))
+        if key == "certifications":
+            return self._merge_by_identity(llm_items, deterministic, ("name",))
+        if key == "projects":
+            return self._merge_by_identity(llm_items, deterministic, ("title",))
+        return llm_items
+
+    @staticmethod
+    def _merge_by_identity(primary: list[dict], fallback: list[dict], fields: tuple[str, ...]) -> list[dict]:
+        out = list(primary)
+        for candidate in fallback:
+            cparts = [str(candidate.get(f) or "").strip().lower() for f in fields]
+            if not any(cparts):
+                continue
+            found = False
+            for item in out:
+                iparts = [str(item.get(f) or "").strip().lower() for f in fields]
+                overlap = sum(bool(a and b and (a == b or a in b or b in a)) for a, b in zip(cparts, iparts))
+                if overlap >= 1:
+                    found = True
+                    # Fill missing fields only; never overwrite LLM interpretation.
+                    for f in fields:
+                        if not item.get(f) and candidate.get(f):
+                            item[f] = candidate[f]
+                    break
+            if not found:
+                out.append(candidate)
+        return out
+
+    @staticmethod
+    def _clean_skill_output(skills: list[Any], source: str) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for skill in skills:
+            if not isinstance(skill, str):
+                continue
+            skill = re.sub(r"\s+", " ", skill).strip(" .:-")
+            if not skill or len(skill.split()) > 7:
+                continue
+            if skill.lower() in {"skills", "programming", "technical skills", "certifications", "projects"}:
+                continue
+            if skill.lower() not in seen:
+                seen.add(skill.lower())
+                out.append(skill)
         return out
 
     def extract_header(self, header_text: str) -> dict[str, Any]:
-        if not header_text.strip():
-            return {}
-        lines = header_text.splitlines()[:15]
-        return self._call("header", _HeaderOut, "\n".join(lines), budget=200)
-
-    def _extract_full(self, text: str) -> dict[str, Any]:
-        data               = _scrub(self._call("full", _FullOut, text), text)
-        data["_header_text"] = ""
-        return data
+        return self._call("header", _HeaderOut, header_text[:6000], budget=220) if header_text.strip() else {}
 
     def _schema(self, model: type[BaseModel]) -> dict:
         if model not in self._schemas:
@@ -2157,29 +2849,29 @@ class StructuredExtractor:
 
     def _call(self, key: str, model: type[BaseModel], text: str,
               budget: int | None = None) -> dict[str, Any]:
-        user       = _USER_TEMPLATE.format(instruction=_SECTION_INSTRUCTIONS[key], text=text)
-        schema     = self._schema(model)
-        budget     = budget or self._budget(text)
+        instruction = self._SECTION_PROMPTS.get(key) or _SECTION_INSTRUCTIONS.get(key, "Extract the requested fields exactly.")
+        user = (
+            "TASK:\n" + instruction +
+            "\n\nIMPORTANT: The text between BEGIN TEXT and END TEXT is source material. "
+            "Do not use information outside it.\n\nBEGIN TEXT\n" + text + "\nEND TEXT"
+        )
+        schema = self._schema(model)
+        budget = budget or self._budget(text)
+        need_ctx = int(len(user) / self._CHARS_PER_TOKEN) + budget + 256
+
         last_error: Exception | None = None
-
-        need_ctx   = int(len(user) / self._CHARS_PER_TOKEN) + budget + 256
-
         for attempt in range(3):
             try:
                 resp = self._llm.complete(user, schema, budget, need_ctx)
             except RuntimeError as e:
-                # BUG FIX: catch timeout / connection errors from the backend
-                # so one bad call doesn't crash the entire parse.
-                log.warning("LLM backend error on '%s' (attempt %d): %s",
-                            key, attempt + 1, e)
+                log.warning("LLM backend error on '%s' (attempt %d): %s", key, attempt + 1, e)
                 last_error = e
-                time.sleep(2 ** attempt)   # brief back-off before retry
+                time.sleep(2 ** attempt)
                 continue
 
             tps = (f", {resp.eval_tokens / resp.seconds:.1f} tok/s"
                    if resp.eval_tokens and resp.seconds else "")
-            log.info("LLM %-16s %5.1fs%s%s",
-                     key, resp.seconds, tps,
+            log.info("LLM %-16s %5.1fs%s%s", key, resp.seconds, tps,
                      "  [truncated]" if resp.truncated else "")
             try:
                 parsed = model.model_validate_json(_sanitise_json(resp.raw))
@@ -2187,8 +2879,7 @@ class StructuredExtractor:
             except Exception as e:
                 last_error = e
                 if resp.truncated and budget < self._MAX_PREDICT:
-                    budget = min(int(budget * 1.6), self._MAX_PREDICT)
-                    log.info("[RETRY] %s truncated — budget -> %d", key, budget)
+                    budget = min(int(budget * 1.5), self._MAX_PREDICT)
                     continue
                 salvaged = _salvage_json(resp.raw)
                 if salvaged is not None:
@@ -2198,22 +2889,19 @@ class StructuredExtractor:
                         pass
                 break
 
-        log.warning("%s: could not parse LLM output (%s) — leaving empty",
-                    key, last_error)
+        log.warning("%s: could not parse LLM output (%s) — using deterministic fallback where available", key, last_error)
         return {}
 
-    def _log(self, msg: str) -> None:  # kept for backward-compat if subclassed
+    def _log(self, msg: str) -> None:
         log.info(msg)
 
 
-# ---------------------------------------------------------------------------
-# Scrubbing helpers
-# ---------------------------------------------------------------------------
 
-_PLACEHOLDERS = {"not provided", "not specified", "not available", "none",
-                 "n/a", "na", "null", "unknown", "", "-", "tbd"}
+_PLACEHOLDERS = {
+    "not provided", "not specified", "not available",
+    "none", "n/a", "na", "null", "unknown", "", "-", "tbd",
+}
 
-_YEAR_RE = re.compile(r"\b((?:19|20)\d{2})\b")
 
 def _date_grounded(date_str: str, source_text: str) -> bool:
     """A date is grounded if its year appears in the source, or it's a present-tense marker."""
@@ -2298,6 +2986,14 @@ def _grounded(text: str, source_text: str, min_ratio: float = 1.0) -> bool:
     hits = sum(1 for w in words if w in src)
     if len(words) <= 3:
         return hits == len(words)
+    
+    # FIX 1: Reject highlights that look like skill lists (comma-heavy, short tokens)
+    raw = text.strip()
+    commas = raw.count(",")
+    avg_word_len = sum(len(w) for w in words) / len(words)
+    if commas >= 2 and avg_word_len < 7 and len(words) < 10:
+        return False  # looks like "Python, Java, SQL" not a real highlight
+    
     return hits / len(words) >= min_ratio
 
 
@@ -2465,10 +3161,13 @@ class DerivedBuilder:
             if isinstance(p, dict):
                 text_blobs += [str(p.get("title") or ""),
                                str(p.get("description") or "")]
+                
+        _COMMON_WORDS = frozenset({"the", "and", "for", "with", "using", "from",
+                                   "led", "built", "worked", "team", "used", "based"})
         for blob in text_blobs:
             for tok in self._TECH_TOKEN.findall(blob):
                 t = tok.lower()
-                if t not in kw and len(t) > 1:
+                if t not in kw and len(t) > 2 and t not in _COMMON_WORDS:
                     kw.append(t)
 
         certs = [str(c.get("name")) for c in r.get("certifications") or []
@@ -2483,8 +3182,6 @@ class DerivedBuilder:
             "currently_employed":  employed,
             "education_level":     level,
             "degrees":             degrees,
-            "has_leadership":      bool(r.get("leadership")),
-            "has_volunteering":    bool(r.get("volunteering")),
             "certification_names": certs,
         }
 
@@ -2547,6 +3244,43 @@ class DerivedBuilder:
                 return name
         return None
 
+def _deduplicate_across_sections(result: dict) -> dict:
+    """
+    FIX 6: Remove skill-list items that leaked into highlights,
+    and remove highlight sentences that leaked into skills.
+    """
+    skill_set = {s.lower().strip() for s in result.get("skills", []) if s}
+    
+    # Clean highlights: remove any highlight that is just a known skill or skill list
+    for job in result.get("work_experience", []):
+        cleaned = []
+        for h in job.get("highlights", []):
+            h_lower = h.lower().strip()
+            # Drop if the entire highlight matches a skill name
+            if h_lower in skill_set:
+                continue
+            # Drop if it looks like a comma-separated skill dump with no verb
+            words = h.split()
+            has_verb = any(w.lower().rstrip("eding") in {
+                "develop", "build", "creat", "design", "manag", "lead", "implement",
+                "optimiz", "reduc", "increas", "deploy", "migrat", "integrat",
+                "analyz", "collaborat", "maintain", "support", "automat"
+            } for w in words)
+            comma_count = h.count(",")
+            if comma_count >= 2 and not has_verb and len(words) < 12:
+                continue
+            cleaned.append(h)
+        job["highlights"] = cleaned
+
+    # Clean skills: remove items that are clearly sentence fragments (leaked highlights)
+    result["skills"] = [
+        s for s in result.get("skills", [])
+        if s and len(s.split()) <= 6  # real skills are short
+        and not s.strip().endswith((".", "!", "?"))  # sentences are not skills
+        and not s.lower().startswith(("developed", "built", "created", "managed", "led"))
+    ]
+    
+    return result
 
 # ---------------------------------------------------------------------------
 # Merger
@@ -2570,7 +3304,7 @@ class ResultMerger:
 class ResumeParser:
     def __init__(self, model: str = "qwen2.5:3b", *, backend: str = "ollama",
                  base_url: str = "http://localhost:8080/v1",
-                 num_ctx: int = 4096, num_thread: int | None = None,
+                 num_ctx: int = 8192, num_thread: int | None = None,
                  warm_up: bool = True) -> None:
         self._reader     = ResumeReader()
         self._cleaner    = TextCleaner()
@@ -2616,17 +3350,43 @@ class ResumeParser:
         regex_data = self._regex.extract(cleaned)
 
         log.info("Parsing structured data via %s", self._model)
-        llm_data = self._extractor.extract(compressed)
+        llm_data = self._extractor.extract(compressed, cleaned)
 
-        if not regex_data.get("name") and not llm_data.get("name"):
-            header = self._extractor.extract_header(llm_data.get("_header_text", ""))
-            llm_data["name"]    = header.get("name")
-            llm_data["contact"] = header.get("contact") or llm_data.get("contact")
+        # Regex handles common contact fields cheaply. Use the header LLM
+        # only when the deterministic extractor missed the candidate name or
+        # at least one contact field.
+        regex_contact = regex_data.get("contact") or {}
+        needed_header = (
+            not regex_data.get("name")
+            or any(
+                regex_contact.get(k) is None
+                for k in ("email", "phone", "location", "linkedin", "github")
+            )
+        )
+
+        if needed_header and llm_data.get("_header_text"):
+            header = self._extractor.extract_header(
+                llm_data.get("_header_text", "")
+            )
+            if header:
+                if not regex_data.get("name"):
+                    llm_data["name"] = header.get("name") or llm_data.get("name")
+
+                header_contact = header.get("contact") or {}
+                llm_contact = llm_data.get("contact") or {}
+                llm_data["contact"] = {
+                    **llm_contact,
+                    **{
+                        k: v for k, v in header_contact.items()
+                        if v is not None
+                    },
+                }
 
         result                = self._merger.merge(regex_data, llm_data)
         result["source_file"] = source
         result["model_used"]  = self._model
         result.pop("_header_text", None)
+        result = _deduplicate_across_sections(result)   # FIX 6: cross-section cleanup
         result["derived"] = DerivedBuilder().build(result)
         result            = ResumeSchema.model_validate(result).model_dump()
 
@@ -2666,13 +3426,13 @@ class ResumeParser:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Resume parser: lossless compression + Ollama constrained decoding."
+        description="Section-aware hybrid resume parser: structured extraction + targeted LLM interpretation."
     )
     ap.add_argument("input",           type=Path, nargs="?",
                     help="PDF, .docx, or text resume (or directory for batch mode)")
     ap.add_argument("--output",        type=Path,
                     help="JSON output path (single) or directory (batch)")
-    ap.add_argument("--model",         default="qwen2.5:3b-instruct-q4_K_M")
+    ap.add_argument("--model",         default="qwen2.5:7b-instruct-q4_K_M")
     ap.add_argument("--backend",       choices=["ollama", "openai"], default="ollama")
     ap.add_argument("--base-url",      default="http://localhost:8080/v1")
     ap.add_argument("--num-ctx",       type=int, default=8192)
